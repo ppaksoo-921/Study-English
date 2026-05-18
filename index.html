@@ -12,6 +12,10 @@
       --sub: #6b7280;
       --accent: #2563eb;
       --border: #dbe3f0;
+      --correct: #16a34a;
+      --correct-bg: #f0fdf4;
+      --wrong: #dc2626;
+      --wrong-bg: #fef2f2;
     }
 
     * {
@@ -73,6 +77,7 @@
       color: var(--sub);
       font-size: 14px;
       min-height: 20px;
+      line-height: 1.5;
     }
 
     .card-wrap {
@@ -119,6 +124,38 @@
       margin-top: 18px;
       font-size: 14px;
       color: var(--sub);
+      line-height: 1.5;
+    }
+
+    .answer-actions {
+      display: none;
+      gap: 12px;
+      width: 100%;
+      max-width: 420px;
+      margin-top: 24px;
+    }
+
+    .answer-actions.show {
+      display: flex;
+    }
+
+    .answer-actions button {
+      flex: 1;
+      font-size: 17px;
+      font-weight: 700;
+      padding: 15px 16px;
+    }
+
+    .correct-btn {
+      border-color: var(--correct);
+      background: var(--correct-bg);
+      color: #166534;
+    }
+
+    .wrong-btn {
+      border-color: var(--wrong);
+      background: var(--wrong-bg);
+      color: #991b1b;
     }
 
     .footer {
@@ -136,7 +173,7 @@
   <div class="controls">
     <label class="file-label" for="csvFile">CSV 불러오기</label>
     <input id="csvFile" type="file" accept=".csv,text/csv" />
-    <button id="shuffleBtn" type="button">새로 섞기</button>
+    <button id="shuffleBtn" type="button">새로 시작</button>
   </div>
 
   <div class="status" id="status">CSV 파일을 먼저 불러오세요.</div>
@@ -146,14 +183,19 @@
       <div class="mode" id="mode">안내</div>
       <div class="content" id="content">CSV를 불러오면
 영어 문제가 시작됩니다.</div>
-      <div class="hint">카드를 터치하면 문제 → 정답 → 다음 문제 순서로 진행됩니다.</div>
+      <div class="hint" id="hint">카드를 터치하면 문제 → 정답 → 채점 순서로 진행됩니다.</div>
+      <div class="answer-actions" id="answerActions">
+        <button class="correct-btn" id="correctBtn" type="button">맞췄어요</button>
+        <button class="wrong-btn" id="wrongBtn" type="button">틀렸어요</button>
+      </div>
     </div>
   </div>
 
   <div class="footer">
     CSV 형식 예시:<br>
     apple,사과<br>
-    banana,바나나
+    banana,바나나<br><br>
+    맞춤/틀림/출제 횟수는 저장하지 않으므로 새로고침하면 초기화됩니다.
   </div>
 
   <script>
@@ -162,13 +204,20 @@
     const card = document.getElementById('card');
     const modeEl = document.getElementById('mode');
     const contentEl = document.getElementById('content');
+    const hintEl = document.getElementById('hint');
     const statusEl = document.getElementById('status');
+    const answerActionsEl = document.getElementById('answerActions');
+    const correctBtn = document.getElementById('correctBtn');
+    const wrongBtn = document.getElementById('wrongBtn');
+
+    // 틀린 단어가 많을 때 한 번에 다시 볼 오답 비율입니다.
+    // 예: 0.5면 오답 중 절반 정도만 우선 후보로 둡니다.
+    const WRONG_REVIEW_RATIO = 0.5;
 
     let vocabList = [];
-    let deck = [];
     let current = null;
     let showingAnswer = false;
-    let solvedCount = 0;
+    let checkedCount = 0;
 
     function parseCSVLine(line) {
       const result = [];
@@ -228,39 +277,132 @@
       return array;
     }
 
-    function refillDeck() {
-      deck = shuffle([...vocabList]);
+    function hideAnswerButtons() {
+      answerActionsEl.classList.remove('show');
+    }
+
+    function showAnswerButtons() {
+      answerActionsEl.classList.add('show');
+    }
+
+    function getStats() {
+      const total = vocabList.length;
+      const correct = vocabList.filter(item => item.isCorrect).length;
+      const wrong = vocabList.filter(item => !item.isCorrect && item.wrongCount > 0).length;
+      const remaining = vocabList.filter(item => !item.isCorrect).length;
+      const totalShown = vocabList.reduce((sum, item) => sum + item.showCount, 0);
+
+      return { total, correct, wrong, remaining, totalShown };
+    }
+
+    function updateStatus(extraText = '') {
+      if (vocabList.length === 0) {
+        statusEl.textContent = '단어 데이터가 없습니다.';
+        return;
+      }
+
+      const stats = getStats();
+      const baseText = `총 ${stats.total}개 | 맞춘 단어 ${stats.correct}개 | 현재 오답 ${stats.wrong}개 | 남은 단어 ${stats.remaining}개 | 출제 ${stats.totalShown}회 | 채점 ${checkedCount}회`;
+      statusEl.textContent = extraText ? `${baseText}\n${extraText}` : baseText;
+    }
+
+    function resetProgress() {
+      vocabList.forEach(item => {
+        item.showCount = 0;
+        item.wrongCount = 0;
+        item.isCorrect = false;
+        item.lastResult = null;
+      });
+
+      current = null;
+      showingAnswer = false;
+      checkedCount = 0;
+      hideAnswerButtons();
+    }
+
+    function pickNextWord() {
+      const eligible = vocabList.filter(item => !item.isCorrect);
+
+      if (eligible.length === 0) {
+        return null;
+      }
+
+      // 1순위: 아직 맞추지 못한 단어 중 출제 횟수가 가장 적은 단어
+      const minShowCount = Math.min(...eligible.map(item => item.showCount));
+      let candidates = eligible.filter(item => item.showCount === minShowCount);
+
+      // 2순위: 후보가 오답 단어들뿐이면 그중 일부만 우선 후보로 사용
+      const wrongCandidates = candidates.filter(item => item.wrongCount > 0);
+      if (wrongCandidates.length > 0) {
+        const subsetSize = Math.max(1, Math.ceil(wrongCandidates.length * WRONG_REVIEW_RATIO));
+        candidates = shuffle([...wrongCandidates]).slice(0, subsetSize);
+      }
+
+      // 같은 출제 횟수끼리는 랜덤으로 골라서 순서가 너무 고정되지 않게 함
+      return candidates[Math.floor(Math.random() * candidates.length)];
     }
 
     function nextQuestion() {
       if (vocabList.length === 0) {
         modeEl.textContent = '안내';
         contentEl.textContent = 'CSV 파일을 먼저 불러오세요.';
+        hintEl.textContent = 'CSV를 불러오면 영어 문제가 시작됩니다.';
         statusEl.textContent = '단어 데이터가 없습니다.';
         current = null;
         showingAnswer = false;
+        hideAnswerButtons();
         return;
       }
 
-      if (deck.length === 0) {
-        refillDeck();
+      const next = pickNextWord();
+
+      if (!next) {
+        modeEl.textContent = '완료';
+        contentEl.textContent = '모든 단어를 맞췄어요!';
+        hintEl.textContent = '다시 연습하려면 새로 시작 버튼을 누르세요.';
+        current = null;
+        showingAnswer = false;
+        hideAnswerButtons();
+        updateStatus('맞춘 단어는 더 이상 출제되지 않습니다.');
+        return;
       }
 
-      current = deck.pop();
+      current = next;
+      current.showCount++;
       showingAnswer = false;
 
       modeEl.textContent = '문제';
       contentEl.textContent = current.word;
-      statusEl.textContent = `총 ${vocabList.length}개 단어 | 현재까지 정답 확인 ${solvedCount}회`;
+      hintEl.textContent = '카드를 터치하면 한국어 정답이 나옵니다.';
+      hideAnswerButtons();
+      updateStatus(`이 단어 출제 횟수: ${current.showCount}회`);
     }
 
     function showAnswer() {
       if (!current) return;
+
       showingAnswer = true;
       modeEl.textContent = '정답';
       contentEl.textContent = current.meaning;
-      solvedCount++;
-      statusEl.textContent = `총 ${vocabList.length}개 단어 | 현재까지 정답 확인 ${solvedCount}회`;
+      hintEl.textContent = '아래에서 이 단어를 맞췄는지 틀렸는지 선택하세요.';
+      showAnswerButtons();
+      updateStatus(`현재 단어: ${current.word} | 출제 횟수: ${current.showCount}회 | 틀린 횟수: ${current.wrongCount}회`);
+    }
+
+    function markAnswer(isCorrect) {
+      if (!current || !showingAnswer) return;
+
+      checkedCount++;
+
+      if (isCorrect) {
+        current.isCorrect = true;
+        current.lastResult = 'correct';
+      } else {
+        current.wrongCount++;
+        current.lastResult = 'wrong';
+      }
+
+      nextQuestion();
     }
 
     fileInput.addEventListener('change', (e) => {
@@ -279,9 +421,17 @@
             return;
           }
 
-          vocabList = parsed;
-          solvedCount = 0;
-          refillDeck();
+          vocabList = parsed.map((item, index) => ({
+            id: index,
+            word: item.word,
+            meaning: item.meaning,
+            showCount: 0,
+            wrongCount: 0,
+            isCorrect: false,
+            lastResult: null
+          }));
+
+          resetProgress();
           nextQuestion();
         } catch (err) {
           console.error(err);
@@ -297,8 +447,8 @@
         alert('먼저 CSV 파일을 불러오세요.');
         return;
       }
-      refillDeck();
-      solvedCount = 0;
+
+      resetProgress();
       nextQuestion();
     });
 
@@ -307,9 +457,17 @@
 
       if (!showingAnswer) {
         showAnswer();
-      } else {
-        nextQuestion();
       }
+    });
+
+    correctBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      markAnswer(true);
+    });
+
+    wrongBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      markAnswer(false);
     });
   </script>
 </body>
